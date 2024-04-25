@@ -16,7 +16,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Clean Train')
     parser.add_argument('--seed', default=0, type=int)
     # We have allowed distributed training on the data.
-    parser.add_argument('--mp_distributed', action='store_true', help='Use distributed training')
+    parser.add_argument('--mp_distributed', default=False, action='store_true', help='Use distributed training')
     parser.add_argument('--world_size', default=1, type=int, help='Number of processes')
     parser.add_argument('--rank', default=0, type=int)
     parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
@@ -26,7 +26,7 @@ if __name__ == '__main__':
     parser.add_argument('-j', '--workers', default=0, type=int, metavar='N')
 
     # Specify the GPU for one GPU training
-    parser.add_argument('--gpu', default=None, type=int, help='GPU to use in non-distributed training')
+    parser.add_argument('--gpu', default=1, type=int, help='GPU to use in non-distributed training')
 
     # Training configs
     parser.add_argument('--root', default='./dataset', type=str, help='Root directory for dataset')
@@ -94,4 +94,4 @@ if __name__ == '__main__':
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
         
-    
+
