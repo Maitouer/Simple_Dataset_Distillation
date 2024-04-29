@@ -1,39 +1,24 @@
 import math
 import os
 import random
-import shutil
-import sys
 import time
-import types
-import warnings
-from statistics import mean
 
 import h5py
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.init as init
 import torch.nn.parallel
 import torch.optim as optim
 import torch.utils.data
 import torch.utils.data.distributed
-import torch_optimizer
 import wandb
-from PIL import Image
-from torch.optim.lr_scheduler import MultiStepLR
-from torch.utils.data.dataset import Dataset
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import Subset
 
 from framework.config import (
-    DistillDataset,
-    get_arch,
-    get_config,
     get_dataset,
-    get_pin_memory,
     get_transform,
 )
 from framework.distill_higher import Distill
@@ -44,7 +29,6 @@ from framework.util import (
     Summary,
     accuracy,
     accuracy_ind,
-    init_gaussian,
 )
 
 os.environ["MASTER_ADDR"] = "localhost"
@@ -66,7 +50,9 @@ def main_worker(gpu, ngpus_per_node, args):
             # global rank among all the processes
             args.rank = args.rank * ngpus_per_node + gpu
 
-        dist.init_process_group(backend=args.dist_backend, world_size=args.world_size, rank=args.rank)
+        dist.init_process_group(
+            backend=args.dist_backend, world_size=args.world_size, rank=args.rank
+        )
 
     torch.manual_seed(args.rank + args.seed)
     np.random.seed(args.rank + args.seed)
@@ -78,14 +64,18 @@ def main_worker(gpu, ngpus_per_node, args):
     print("Dataset Path: %s" % args.root)
     print(args)
 
-    pathdir = "./train_log/{}/{}_{}_Adam{}".format(args.dataset, args.epochs, args.batch_size, int(args.lr * 1000))
+    pathdir = "./train_log/{}/{}_{}_Adam{}".format(
+        args.dataset, args.epochs, args.batch_size, int(args.lr * 1000)
+    )
 
     # 0. Preprocess datasets
     print("==> Preparing data..")
     transform_train, transform_test = get_transform(args.dataset)
     print(transform_train, transform_test)
 
-    train1, train2, testset, num_classes, shape, _ = get_dataset(args.dataset, args.data_root, transform_train, transform_test, zca=args.zca)
+    train1, train2, testset, num_classes, shape, _ = get_dataset(
+        args.dataset, args.data_root, transform_train, transform_test, zca=args.zca
+    )
     print("Dataset: number of classes: {}".format(num_classes))
     args.num_classes = num_classes
     if args.limit_train:
@@ -102,8 +92,22 @@ def main_worker(gpu, ngpus_per_node, args):
         train_sampler = None
     val_sampler = None
 
-    train_loader = torch.utils.data.DataLoader(train1, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-    test_loader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, sampler=val_sampler)
+    train_loader = torch.utils.data.DataLoader(
+        train1,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        num_workers=args.workers,
+        pin_memory=True,
+        sampler=train_sampler,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        testset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=True,
+        sampler=val_sampler,
+    )
 
     # Initialize Distilled Dataset
     channel, height, width = shape
@@ -119,7 +123,11 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # Data augmentations for synthetic data and the real data
     syn_intervention, real_intervention, interv_prob = set_up_interventions(args)
-    print("Synthetic images, not_single {}, keys {}".format(syn_intervention.not_single, syn_intervention.keys))
+    print(
+        "Synthetic images, not_single {}, keys {}".format(
+            syn_intervention.not_single, syn_intervention.keys
+        )
+    )
     args.syn_intervention = syn_intervention
     args.real_intervention = real_intervention
     args.shape = shape
@@ -127,7 +135,25 @@ def main_worker(gpu, ngpus_per_node, args):
     # 1. Initialize Distilled Dataset Module
     print("==> Building model..")
     print("Initialized data with size, x: {}, y:{}".format(x_init.shape, y_init.shape))
-    model = Distill(x_init, y_init, args.arch, args.window, args.inner_lr, args.num_train_eval, img_pc=args.num_per_class, batch_pc=args.batch_per_class, train_y=args.train_y, channel=shape[0], num_classes=num_classes, task_sampler_nc=args.task_sampler_nc, im_size=(shape[1], shape[2]), inner_optim=args.inner_optim, syn_intervention=syn_intervention, real_intervention=real_intervention, cctype=args.cctype)
+    model = Distill(
+        x_init,
+        y_init,
+        args.arch,
+        args.window,
+        args.inner_lr,
+        args.num_train_eval,
+        img_pc=args.num_per_class,
+        batch_pc=args.batch_per_class,
+        train_y=args.train_y,
+        channel=shape[0],
+        num_classes=num_classes,
+        task_sampler_nc=args.task_sampler_nc,
+        im_size=(shape[1], shape[2]),
+        inner_optim=args.inner_optim,
+        syn_intervention=syn_intervention,
+        real_intervention=real_intervention,
+        cctype=args.cctype,
+    )
     print(model.net)
 
     # The data is intialized with random values, not from real images to remove any bias
@@ -146,14 +172,18 @@ def main_worker(gpu, ngpus_per_node, args):
                 # we could use the same data across all gpus?
                 args.batch_size = int(args.batch_size / ngpus_per_node)
                 args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+                model = torch.nn.parallel.DistributedDataParallel(
+                    model, device_ids=[args.gpu], find_unused_parameters=True
+                )
             else:
                 model.cuda()
                 if not args.train_y:
                     model.label = model.label.cuda()
                 # DistributedDataParallel will divide and allocate batch_size to all
                 # available GPUs if device_ids are not set
-                model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
+                model = torch.nn.parallel.DistributedDataParallel(
+                    model, find_unused_parameters=True
+                )
     elif args.gpu is not None and torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
@@ -184,7 +214,9 @@ def main_worker(gpu, ngpus_per_node, args):
     # if ckptname is given, load the data from the file as initialization
     if args.ckptname != "none":
         db = h5py.File(args.ckptname, "r")
-        print(db["data"].shape[0], int(x_init.shape[0] / num_classes), args.num_per_class)
+        print(
+            db["data"].shape[0], int(x_init.shape[0] / num_classes), args.num_per_class
+        )
         base_data = torch.tensor(db["data"][:]).cuda()
         if args.train_y:
             label_data = torch.tensor(db["label"][:]).cuda()
@@ -195,12 +227,27 @@ def main_worker(gpu, ngpus_per_node, args):
 
     if args.train_y:
         if args.outer_optim == "Adam":
-            optimizer = optim.Adam([{"params": model.data.weight}, {"params": model.label.weight, "lr": args.lr / args.label_lr_scale}], lr=args.lr, betas=(0.9, 0.999), eps=args.eps, weight_decay=args.wd)
+            optimizer = optim.Adam(
+                [
+                    {"params": model.data.weight},
+                    {"params": model.label.weight, "lr": args.lr / args.label_lr_scale},
+                ],
+                lr=args.lr,
+                betas=(0.9, 0.999),
+                eps=args.eps,
+                weight_decay=args.wd,
+            )
         else:
             raise NotImplementedError()
     else:
         # optimizer = optim.SGD([model.data], lr=args.lr, momentum=0.5, weight_decay=0)
-        optimizer = optim.Adam([model.data.weight], lr=args.lr, betas=(0.9, 0.999), eps=args.eps, weight_decay=args.wd)
+        optimizer = optim.Adam(
+            [model.data.weight],
+            lr=args.lr,
+            betas=(0.9, 0.999),
+            eps=args.eps,
+            weight_decay=args.wd,
+        )
 
     # how to visualize in DDP?
     best_rec = {}
@@ -209,7 +256,9 @@ def main_worker(gpu, ngpus_per_node, args):
 
     distill_steps = 0
     if args.ddtype == "curriculum" and args.cctype != 2:
-        model.curriculum = [args.totwindow - args.window, args.minwindow, 0, 0, 0, 0][args.cctype]
+        model.curriculum = [args.totwindow - args.window, args.minwindow, 0, 0, 0, 0][
+            args.cctype
+        ]
 
     if model.data.weight.get_device() == 0 and args.wandb:
         wandb.init(
@@ -221,9 +270,24 @@ def main_worker(gpu, ngpus_per_node, args):
         )
 
     if args.ddtype == "standard":
-        fname = "./grad_save_init_IPC_" + str(args.num_per_class) + "_no_curr_unroll_" + str(args.window) + args.fname + ".h5"
+        fname = (
+            "./grad_save_init_IPC_"
+            + str(args.num_per_class)
+            + "_no_curr_unroll_"
+            + str(args.window)
+            + args.fname
+            + ".h5"
+        )
     else:
-        fname = "./save/{}/IPC_{}_{}_curr_unroll_{}_{}_{}_{}.h5".format(str(args.dataset), str(args.num_per_class), str(args.cctype), str(args.window), str(args.totwindow), str(args.minwindow), args.fname)
+        fname = "./save/{}/IPC_{}_{}_curr_unroll_{}_{}_{}_{}.h5".format(
+            str(args.dataset),
+            str(args.num_per_class),
+            str(args.cctype),
+            str(args.window),
+            str(args.totwindow),
+            str(args.minwindow),
+            args.fname,
+        )
 
     if args.load_ckpt:
         checkpoint = torch.load(fname[:-3] + ".pth")
@@ -237,7 +301,9 @@ def main_worker(gpu, ngpus_per_node, args):
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             args.start_epoch = checkpoint["epoch"]
             distill_steps = args.start_epoch * int(50000 / args.batch_size)
-        print("=== Successfully loading the data from {} ===".format(fname[:-3] + ".pth"))
+        print(
+            "=== Successfully loading the data from {} ===".format(fname[:-3] + ".pth")
+        )
         model.ema_init(args.clip_coef)
         ### TO DO: add EMA loading for distilled data
 
@@ -245,7 +311,16 @@ def main_worker(gpu, ngpus_per_node, args):
         # initialize the EMA
         if epoch == 0:
             model.ema_init(args.clip_coef)
-        grad_tmp, losses_avg, distill_steps = train(train_loader, model, criterion, optimizer, epoch, device, distill_steps, args)
+        grad_tmp, losses_avg, distill_steps = train(
+            train_loader,
+            model,
+            criterion,
+            optimizer,
+            epoch,
+            device,
+            distill_steps,
+            args,
+        )
         grad_acc.append(grad_tmp)
         print("The current update step is {}".format(distill_steps))
 
@@ -257,13 +332,25 @@ def main_worker(gpu, ngpus_per_node, args):
                 print("The current lr is: {}".format(model.lr))
             if model.data.weight.get_device() == 0:
                 print("Testing Results:")
-            test_acc, test_loss, scores = test([test_loader, train_loader], model, criterion, args)
+            test_acc, test_loss, scores = test(
+                [test_loader, train_loader], model, criterion, args
+            )
             if model.data.weight.get_device() == 0:
                 print(test_acc)
             tmp_index = test_acc[0].index(max(test_acc[0]))
 
             if model.data.weight.get_device() == 0 and args.wandb:
-                wandb.log({"loss": test_loss, "epoch": int(epoch), "distill_steps": distill_steps, "grad_norm": grad_tmp[-1], "train_acc": test_acc[1][-1], "test_acc": test_acc[0][-1], "curr": model.curriculum})
+                wandb.log(
+                    {
+                        "loss": test_loss,
+                        "epoch": int(epoch),
+                        "distill_steps": distill_steps,
+                        "grad_norm": grad_tmp[-1],
+                        "train_acc": test_acc[1][-1],
+                        "test_acc": test_acc[0][-1],
+                        "curr": model.curriculum,
+                    }
+                )
 
             # remember best acc@1 and save checkpoint
             is_best = test_acc[0][tmp_index] > best_acc1
@@ -277,7 +364,9 @@ def main_worker(gpu, ngpus_per_node, args):
                     best_rec["epoch"] = epoch + 1
                     best_rec["data"] = model.data.weight.data.cpu().clone().numpy()
                     if args.train_y:
-                        best_rec["label"] = model.label.weight.data.cpu().clone().numpy()
+                        best_rec["label"] = (
+                            model.label.weight.data.cpu().clone().numpy()
+                        )
 
             if model.data.weight.get_device() == 0:
                 with h5py.File(fname, "w") as f:
@@ -287,11 +376,19 @@ def main_worker(gpu, ngpus_per_node, args):
                         f.create_dataset("label", data=best_rec["label"])
                 checkpoint = {
                     "epoch": epoch,
-                    "model_state_dict": {"module.data.weight": model.state_dict()["module.data.weight"].cpu().clone()},
+                    "model_state_dict": {
+                        "module.data.weight": model.state_dict()["module.data.weight"]
+                        .cpu()
+                        .clone()
+                    },
                     "optimizer_state_dict": optimizer.state_dict(),
                 }
                 if args.train_y:
-                    checkpoint["label_state_dict"] = {"module.label.weight": model.state_dict()["module.label.weight"].cpu().clone()}
+                    checkpoint["label_state_dict"] = {
+                        "module.label.weight": model.state_dict()["module.label.weight"]
+                        .cpu()
+                        .clone()
+                    }
                 torch.save(checkpoint, fname[:-3] + ".pth")
             # update curriculum
 
@@ -309,8 +406,14 @@ def main_worker(gpu, ngpus_per_node, args):
                             if model.curriculum == args.totwindow - args.window:
                                 break
                             model.curriculum += args.window
-                            model.curriculum = min(args.totwindow - args.window, model.curriculum)
-            print("train loss {}, epoch {}, best loss {}, best_epoch {}".format(test_loss, epoch, best_loss1, best_loss_ind))
+                            model.curriculum = min(
+                                args.totwindow - args.window, model.curriculum
+                            )
+            print(
+                "train loss {}, epoch {}, best loss {}, best_epoch {}".format(
+                    test_loss, epoch, best_loss1, best_loss_ind
+                )
+            )
 
     if model.data.weight.get_device() == 0:
         print("=== Final results:")
@@ -325,12 +428,18 @@ def main_worker(gpu, ngpus_per_node, args):
             f.create_dataset("data", data=best_rec["data"])
 
 
-def train(train_loader, model, criterion, optimizer, epoch, device, distill_steps, args):
+def train(
+    train_loader, model, criterion, optimizer, epoch, device, distill_steps, args
+):
     batch_time = AverageMeter("Time", ":6.3f")
     data_time = AverageMeter("Data", ":6.3f")
     losses = AverageMeter("Loss", ":.4e")
     top1 = AverageMeter("Acc@1", ":6.2f")
-    progress = ProgressMeter(len(train_loader), [batch_time, data_time, losses, top1], prefix="Epoch: [{}]".format(epoch))
+    progress = ProgressMeter(
+        len(train_loader),
+        [batch_time, data_time, losses, top1],
+        prefix="Epoch: [{}]".format(epoch),
+    )
 
     # switch to train mode
     model.train()
@@ -340,7 +449,9 @@ def train(train_loader, model, criterion, optimizer, epoch, device, distill_step
     grad_acc = []
     if model.cctype == 2:
         if args.rank == 0:
-            shared_curriculum = torch.tensor(random.randint(args.minwindow, args.totwindow - args.window))
+            shared_curriculum = torch.tensor(
+                random.randint(args.minwindow, args.totwindow - args.window)
+            )
         else:
             shared_curriculum = torch.tensor(0)
         shared_curriculum = shared_curriculum.to(device)
@@ -349,13 +460,19 @@ def train(train_loader, model, criterion, optimizer, epoch, device, distill_step
 
         model.curriculum = shared_curriculum.item()
 
-    print("GPU_{}_using curriculum {} with window {}".format(args.rank, model.curriculum, model.window))
+    print(
+        "GPU_{}_using curriculum {} with window {}".format(
+            args.rank, model.curriculum, model.window
+        )
+    )
 
     for train1 in enumerate(train_loader):
         if args.complete_random:
             if model.cctype == 2:
                 if args.rank == 0:
-                    shared_curriculum = torch.tensor(random.randint(args.minwindow, args.totwindow - args.window))
+                    shared_curriculum = torch.tensor(
+                        random.randint(args.minwindow, args.totwindow - args.window)
+                    )
                 else:
                     shared_curriculum = torch.tensor(0)
                 shared_curriculum = shared_curriculum.to(device)
@@ -364,7 +481,11 @@ def train(train_loader, model, criterion, optimizer, epoch, device, distill_step
 
                 model.curriculum = shared_curriculum.item()
 
-            print("GPU_{}_using curriculum {} with window {}".format(args.rank, model.curriculum, model.window))
+            print(
+                "GPU_{}_using curriculum {} with window {}".format(
+                    args.rank, model.curriculum, model.window
+                )
+            )
 
         data_time.update(time.time() - end)
 
@@ -385,11 +506,25 @@ def train(train_loader, model, criterion, optimizer, epoch, device, distill_step
         for clear_cache in range(5):
             torch.cuda.empty_cache()
 
-        grad_norm = calculate_grad_norm(torch.norm(optimizer.param_groups[0]["params"][0].grad.clone().detach(), dim=1))
+        grad_norm = calculate_grad_norm(
+            torch.norm(
+                optimizer.param_groups[0]["params"][0].grad.clone().detach(), dim=1
+            )
+        )
 
         grad_acc.append(grad_norm)
         # obtain the ema norm and perform gradient clipping
-        clip_coef = model.ema_update((torch.norm(optimizer.param_groups[0]["params"][0].grad.clone().detach(), dim=1) ** 2).sum().item() ** 0.5)
+        clip_coef = model.ema_update(
+            (
+                torch.norm(
+                    optimizer.param_groups[0]["params"][0].grad.clone().detach(), dim=1
+                )
+                ** 2
+            )
+            .sum()
+            .item()
+            ** 0.5
+        )
 
         torch.nn.utils.clip_grad_norm_(model.data.weight, max_norm=clip_coef * 2)
 
@@ -417,8 +552,12 @@ def train(train_loader, model, criterion, optimizer, epoch, device, distill_step
 
 # use pair_aug with train will apply a deterministic augmentation for all the data
 def set_up_interventions(args):
-    syn_intervention = ImageIntervention("syn_aug", args.syn_strategy, phase="test", not_single=args.comp_aug)
-    real_intervention = ImageIntervention("real_aug", args.real_strategy, phase="test", not_single=args.comp_aug_real)
+    syn_intervention = ImageIntervention(
+        "syn_aug", args.syn_strategy, phase="test", not_single=args.comp_aug
+    )
+    real_intervention = ImageIntervention(
+        "real_aug", args.real_strategy, phase="test", not_single=args.comp_aug_real
+    )
     # This is a customizable prob \in [0, 1]
     intervention_prob = 1.0
 
@@ -486,7 +625,10 @@ def one_gpu_test_2(val_loader, model, args):
 # project the data to a unit ball
 def project(data, pgd_coef=1):
     coef_norm = 1 / math.sqrt(data.shape[1])
-    data_norm = torch.reshape(torch.norm(torch.flatten(data, start_dim=1, end_dim=-1), dim=-1), [data.shape[0], *[1] * (data.dim() - 1)])
+    data_norm = torch.reshape(
+        torch.norm(torch.flatten(data, start_dim=1, end_dim=-1), dim=-1),
+        [data.shape[0], *[1] * (data.dim() - 1)],
+    )
     return data / data_norm * pgd_coef
 
 
@@ -505,7 +647,9 @@ def test(data_loaders, model, criterion, args):
             model.net.train()
             model.init_train(epoch_list[train_time] - start_epoch)
             for loader_i in range(len(data_loaders)):
-                tmp_acc, tmp_loss = default_test(data_loaders[loader_i], model, criterion, args)
+                tmp_acc, tmp_loss = default_test(
+                    data_loaders[loader_i], model, criterion, args
+                )
                 acc[loader_i][train_time] += tmp_acc
             start_epoch = epoch_list[train_time]
         loss += tmp_loss
@@ -520,7 +664,11 @@ def test(data_loaders, model, criterion, args):
         if model.data.weight.get_device() == 0:
             for train_time in range(len(epoch_list)):
                 if model.data.weight.get_device() == 0:
-                    print("Training for {} epoch: {}".format(epoch_list[train_time], acc[loader_i][train_time]))
+                    print(
+                        "Training for {} epoch: {}".format(
+                            epoch_list[train_time], acc[loader_i][train_time]
+                        )
+                    )
     return acc, tmp_loss / args.num_train_eval, acc_ind
 
 
@@ -563,16 +711,35 @@ def default_test(val_loader, model, criterion, args):
     #     [batch_time, losses, top1],
     #     prefix='Test: ')
 
-    progress = ProgressMeter(len(val_loader) + (args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))), [batch_time, losses, top1], prefix="Test: ")
+    progress = ProgressMeter(
+        len(val_loader)
+        + (
+            args.distributed
+            and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))
+        ),
+        [batch_time, losses, top1],
+        prefix="Test: ",
+    )
 
     run_validate(val_loader)
     if args.distributed:
         top1.all_reduce()
         losses.all_reduce()
 
-    if args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset)):
-        aux_val_dataset = Subset(val_loader.dataset, range(len(val_loader.sampler) * args.world_size, len(val_loader.dataset)))
-        aux_val_loader = torch.utils.data.DataLoader(aux_val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+    if args.distributed and (
+        len(val_loader.sampler) * args.world_size < len(val_loader.dataset)
+    ):
+        aux_val_dataset = Subset(
+            val_loader.dataset,
+            range(len(val_loader.sampler) * args.world_size, len(val_loader.dataset)),
+        )
+        aux_val_loader = torch.utils.data.DataLoader(
+            aux_val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=True,
+        )
         run_validate(aux_val_loader, len(val_loader))
     if model.data.weight.get_device() == 0:
         progress.display_summary()
